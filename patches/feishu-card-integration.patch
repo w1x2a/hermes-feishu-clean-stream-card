@@ -1,0 +1,355 @@
+diff --git a/gateway/platforms/feishu.py b/gateway/platforms/feishu.py
+index a9b044708..5a8e695ea 100644
+--- a/gateway/platforms/feishu.py
++++ b/gateway/platforms/feishu.py
+@@ -1846,6 +1846,58 @@ class FeishuAdapter(BasePlatformAdapter):
+             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
+             return SendResult(success=False, error=str(exc))
+ 
++    async def send_interactive_card(
++        self,
++        chat_id: str,
++        card: Dict[str, Any],
++        reply_to: Optional[str] = None,
++        metadata: Optional[Dict[str, Any]] = None,
++    ) -> SendResult:
++        """Send a pre-built interactive card and return the resulting message_id."""
++        if not self._client:
++            return SendResult(success=False, error="Not connected")
++        try:
++            payload = json.dumps(card, ensure_ascii=False)
++            response = await self._feishu_send_with_retry(
++                chat_id=chat_id,
++                msg_type="interactive",
++                payload=payload,
++                reply_to=reply_to,
++                metadata=metadata,
++            )
++            return self._finalize_send_result(response, "send_interactive_card failed")
++        except Exception as exc:
++            logger.warning("[Feishu] send_interactive_card failed: %s", exc)
++            return SendResult(success=False, error=str(exc))
++
++    async def edit_interactive_card(
++        self,
++        chat_id: str,
++        message_id: str,
++        card: Dict[str, Any],
++    ) -> SendResult:
++        """Update a previously sent interactive card via im.v1.message.patch."""
++        if not self._client:
++            return SendResult(success=False, error="Not connected")
++        try:
++            from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
++            payload = json.dumps(card, ensure_ascii=False)
++            body = PatchMessageRequestBody.builder().content(payload).build()
++            request = (
++                PatchMessageRequest.builder()
++                .message_id(message_id)
++                .request_body(body)
++                .build()
++            )
++            response = await asyncio.to_thread(self._client.im.v1.message.patch, request)
++            result = self._finalize_send_result(response, "edit_interactive_card failed")
++            if result.success:
++                result.message_id = message_id
++            return result
++        except Exception as exc:
++            logger.error("[Feishu] Failed to edit interactive card %s: %s", message_id, exc, exc_info=True)
++            return SendResult(success=False, error=str(exc))
++
+     async def send_exec_approval(
+         self, chat_id: str, command: str, session_key: str,
+         description: str = "dangerous command",
+diff --git a/gateway/run.py b/gateway/run.py
+index 818bd282d..8aba26445 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -14752,6 +14752,49 @@ class GatewayRunner:
+         
+         # Queue for progress messages (thread-safe)
+         progress_queue = queue.Queue() if tool_progress_enabled else None
++        _feishu_card_enabled = False
++        _feishu_card_state = None
++        _feishu_card_queue = None
++        _feishu_card_stop = None
++        _feishu_card_msg_id = None
++        _feishu_card_runtime = None
++        _feishu_card_sequence = 0
++
++        def _next_feishu_card_sequence() -> int:
++            nonlocal _feishu_card_sequence
++            _feishu_card_sequence += 1
++            return _feishu_card_sequence
++
++        if source.platform == Platform.FEISHU:
++            try:
++                from gateway.feishu_stream_card import (
++                    FeishuCardRuntimeStatus,
++                    FeishuTaskCardState,
++                    edit_card_with_retry,
++                    resolve_card_config,
++                    resolve_heartbeat_interval,
++                    streaming_enabled as _feishu_streaming_enabled,
++                )
++                _feishu_card_enabled = _feishu_streaming_enabled()
++                if _feishu_card_enabled:
++                    _platform_cfg_for_card = ((user_config.get("display") or {}).get("platforms") or {}).get("feishu") or {}
++                    _card_cfg = resolve_card_config(_platform_cfg_for_card)
++                    _feishu_card_state = FeishuTaskCardState(
++                        title=(message or _card_cfg.title)[:80] or _card_cfg.title,
++                        total_steps=0,
++                        current_step=1,
++                        status="排队中",
++                        action="正在处理任务",
++                        footer_fields=_card_cfg.footer_fields,
++                    )
++                    _feishu_card_runtime = FeishuCardRuntimeStatus()
++                    self._feishu_card_runtime_status = _feishu_card_runtime
++                    _feishu_card_queue = queue.Queue()
++                    _feishu_card_stop = asyncio.Event()
++                    progress_queue = None
++            except Exception as _card_err:
++                logger.debug("Feishu stream card setup skipped: %s", _card_err)
++        suppress_plain_progress = source.platform == Platform.FEISHU and _feishu_card_enabled
+         last_tool = [None]  # Mutable container for tracking in closure
+         last_progress_msg = [None]  # Track last message for dedup
+         repeat_count = [0]  # How many times the same message repeated
+@@ -14780,7 +14823,31 @@ class GatewayRunner:
+ 
+         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
+             """Callback invoked by agent on tool lifecycle events."""
+-            if not progress_queue or not _run_still_current():
++            if not _run_still_current():
++                return
++            if suppress_plain_progress:
++                if _feishu_card_queue is None or event_type not in {"tool.started", "tool.completed"}:
++                    return
++                from gateway.progress_sanitizer import summarize_tool_completed, summarize_tool_started
++                if event_type == "tool.started":
++                    msg = summarize_tool_started(tool_name, preview, args, platform_key=platform_key)
++                else:
++                    msg = summarize_tool_completed(
++                        tool_name,
++                        args,
++                        duration=kwargs.get("duration"),
++                        is_error=bool(kwargs.get("is_error", False)),
++                        platform_key=platform_key,
++                    )
++                if msg:
++                    _feishu_card_queue.put({
++                        "event": event_type,
++                        "message": msg,
++                        "tool": tool_name,
++                        "sequence": _next_feishu_card_sequence(),
++                    })
++                return
++            if not progress_queue:
+                 return
+ 
+             # First-touch onboarding: the first time a tool takes longer than
+@@ -14913,6 +14980,111 @@ class GatewayRunner:
+             else None
+         )
+ 
++        async def send_feishu_card_updates():
++            if not _feishu_card_enabled or _feishu_card_state is None or _feishu_card_queue is None:
++                return
++            adapter = self.adapters.get(source.platform)
++            if not adapter or not hasattr(adapter, "send_interactive_card"):
++                return
++            try:
++                heartbeat_interval = resolve_heartbeat_interval(agent_cfg_local)
++            except Exception:
++                heartbeat_interval = 60.0
++            min_interval = 1.5
++            last_update = 0.0
++            last_heartbeat = 0.0
++            try:
++                result = await adapter.send_interactive_card(
++                    chat_id=source.chat_id,
++                    card=_feishu_card_state.render_card(include_stop=False),
++                    reply_to=_progress_reply_to,
++                    metadata=_progress_metadata,
++                )
++                nonlocal _feishu_card_msg_id
++                if getattr(result, "success", False):
++                    _feishu_card_msg_id = getattr(result, "message_id", None)
++                    if not _feishu_card_msg_id:
++                        logger.info("Feishu stream card initial send returned no message_id; card cannot be edited")
++                        return
++                    if _feishu_card_runtime is not None:
++                        _feishu_card_runtime.record_send(success=True, message_id=_feishu_card_msg_id)
++                    logger.info("Feishu stream card sent: message_id=%s", _feishu_card_msg_id)
++                else:
++                    if _feishu_card_runtime is not None:
++                        _feishu_card_runtime.record_send(success=False, error=getattr(result, "error", ""))
++                    logger.info("Feishu stream card initial send failed: %s", getattr(result, "error", ""))
++                    return
++                _feishu_card_state.last_render_key = _feishu_card_state.render_key()
++                last_update = time.monotonic()
++                last_heartbeat = last_update
++                while True:
++                    changed = False
++                    try:
++                        raw = _feishu_card_queue.get_nowait()
++                        if not isinstance(raw, tuple):
++                            changed = bool(_feishu_card_state.update_from_progress(raw))
++                    except queue.Empty:
++                        await asyncio.sleep(0.5)
++                    if not changed:
++                        try:
++                            _agent_ref = agent_holder[0] if agent_holder else None
++                            if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
++                                _act = _agent_ref.get_activity_summary()
++                                _desc = str(_act.get("last_activity_desc") or "")
++                                _tool = _act.get("current_tool")
++                                _iter_text = f"第 {_act.get('api_call_count', 0)}/{_act.get('max_iterations', '?')} 轮"
++                                if _tool:
++                                    changed = bool(_feishu_card_state.update_from_progress({
++                                        "event": "tool.started",
++                                        "message": f"{_iter_text}，正在用工具：{_tool}",
++                                        "tool": _tool,
++                                        "sequence": _next_feishu_card_sequence(),
++                                    }))
++                                elif "waiting for provider response" in _desc or "waiting for non-streaming" in _desc:
++                                    changed = bool(_feishu_card_state.update_from_progress({
++                                        "event": "model.waiting",
++                                        "message": f"{_iter_text}，正在等模型返回，不是卡死",
++                                        "sequence": _next_feishu_card_sequence(),
++                                    }))
++                        except Exception:
++                            pass
++                    if _feishu_card_state.mark_stuck_if_needed():
++                        changed = True
++                    now_m = time.monotonic()
++                    heartbeat = now_m - last_heartbeat >= heartbeat_interval
++                    if changed or heartbeat:
++                        key = _feishu_card_state.render_key()
++                        if (key != _feishu_card_state.last_render_key or heartbeat) and now_m - last_update >= min_interval:
++                            edit_result = await edit_card_with_retry(
++                                adapter,
++                                chat_id=source.chat_id,
++                                message_id=_feishu_card_msg_id,
++                                card=_feishu_card_state.render_card(include_stop=False),
++                                runtime_status=_feishu_card_runtime,
++                                max_attempts=1,
++                                delays=(),
++                            )
++                            if getattr(edit_result, "success", False):
++                                logger.info("Feishu stream card edited: message_id=%s status=%s attempts=%s", _feishu_card_msg_id, _feishu_card_state.status, getattr(_feishu_card_runtime, "last_edit_attempts", 1))
++                            else:
++                                logger.info("Feishu stream card edit failed: message_id=%s error=%s attempts=%s", _feishu_card_msg_id, getattr(edit_result, "error", ""), getattr(_feishu_card_runtime, "last_edit_attempts", 1))
++                            _feishu_card_state.last_render_key = key
++                            last_update = now_m
++                            last_heartbeat = now_m
++                    if _feishu_card_stop is not None and _feishu_card_stop.is_set():
++                        break
++                while True:
++                    try:
++                        raw = _feishu_card_queue.get_nowait()
++                        if not isinstance(raw, tuple):
++                            _feishu_card_state.update_from_progress(raw)
++                    except queue.Empty:
++                        break
++            except asyncio.CancelledError:
++                return
++            except Exception as e:
++                logger.error("Feishu stream card updater error: %s", e, exc_info=True)
++
+         async def send_progress_messages():
+             if not progress_queue:
+                 return
+@@ -16019,7 +16191,9 @@ class GatewayRunner:
+         
+         # Start progress message sender if enabled
+         progress_task = None
+-        if tool_progress_enabled:
++        if _feishu_card_enabled:
++            progress_task = asyncio.create_task(send_feishu_card_updates())
++        elif tool_progress_enabled:
+             progress_task = asyncio.create_task(send_progress_messages())
+ 
+         # Start stream consumer task — polls for consumer creation since it
+@@ -16143,6 +16317,8 @@ class GatewayRunner:
+                         _status_detail = " — " + ", ".join(_parts)
+                     except Exception:
+                         pass
++                if _feishu_card_enabled and _feishu_card_msg_id:
++                    continue  # stream card is active; no need for text notification
+                 try:
+                     _notify_res = await _notify_adapter.send(
+                         source.chat_id,
+@@ -16335,6 +16511,44 @@ class GatewayRunner:
+                     "failed": True,
+                 }
+ 
++            if _feishu_card_enabled and _feishu_card_state is not None and _feishu_card_msg_id:
++                try:
++                    _final_text = str((response or {}).get("final_response") or "验证通过，任务完成")
++                    _resp = response or {}
++                    _feishu_card_state.set_runtime_info(
++                        model=_resp.get("model"),
++                        input_tokens=_resp.get("input_tokens"),
++                        output_tokens=_resp.get("output_tokens"),
++                        last_prompt_tokens=_resp.get("last_prompt_tokens"),
++                        context_length=_resp.get("context_length"),
++                    )
++                    if _resp.get("failed") or _resp.get("error"):
++                        _feishu_card_state.fail(_final_text)
++                    elif _resp.get("interrupted"):
++                        _feishu_card_state.fail("任务已被新消息打断")
++                    else:
++                        _feishu_card_state.complete(_final_text[:300])
++                    if _feishu_card_stop is not None:
++                        _feishu_card_stop.set()
++                    if progress_task:
++                        try:
++                            await asyncio.wait_for(progress_task, timeout=5.0)
++                        except Exception:
++                            pass
++                    _card_adapter = self.adapters.get(source.platform)
++                    if _card_adapter and hasattr(_card_adapter, "edit_interactive_card"):
++                        await edit_card_with_retry(
++                            _card_adapter,
++                            chat_id=source.chat_id,
++                            message_id=_feishu_card_msg_id,
++                            card=_feishu_card_state.render_card(include_stop=False),
++                            runtime_status=_feishu_card_runtime,
++                            max_attempts=3,
++                            delays=(1.0, 2.0),
++                        )
++                except Exception as _card_final_err:
++                    logger.debug("Feishu stream card final update failed: %s", _card_final_err)
++
+             # Track fallback model state: if the agent switched to a
+             # fallback model during this run, persist it so /model shows
+             # the actually-active model instead of the config default.
+@@ -16576,6 +16790,27 @@ class GatewayRunner:
+             interrupt_monitor.cancel()
+             _notify_task.cancel()
+ 
++            # Finalize Feishu stream card if not already done (e.g. on /stop cancellation)
++            if (_feishu_card_enabled and _feishu_card_state is not None and _feishu_card_msg_id
++                    and _feishu_card_state.status not in {"已完成", "已失败", "已超时"}):
++                try:
++                    if _feishu_card_stop is not None:
++                        _feishu_card_stop.set()
++                    _feishu_card_state.fail("任务已停止")
++                    _card_adapter = self.adapters.get(source.platform)
++                    if _card_adapter and hasattr(_card_adapter, "edit_interactive_card"):
++                        from gateway.feishu_stream_card import edit_card_with_retry as _ecwr
++                        await asyncio.shield(_ecwr(
++                            _card_adapter,
++                            chat_id=source.chat_id,
++                            message_id=_feishu_card_msg_id,
++                            card=_feishu_card_state.render_card(include_stop=False),
++                            max_attempts=2,
++                            delays=(0.5,),
++                        ))
++                except Exception as _card_cancel_err:
++                    logger.debug("Feishu stream card cancel finalize failed: %s", _card_cancel_err)
++
+             # Wait for stream consumer to finish its final edit
+             if stream_task:
+                 try:
