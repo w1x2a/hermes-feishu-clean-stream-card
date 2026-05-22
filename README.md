@@ -1,4 +1,31 @@
+---
+title: Hermes Feishu Clean Stream Card Patch
+description: Feishu/Lark clean stream task card patch for Hermes Agent
+---
+
 # Hermes Feishu Clean Stream Card Patch
+
+> Pages 友好版首页 · 只做排版美化与导航整理。
+
+**快速入口**
+- 仓库主页：<https://github.com/w1x2a/hermes-feishu-clean-stream-card>
+- Releases：<https://github.com/w1x2a/hermes-feishu-clean-stream-card/releases>
+- 简介：Feishu/Lark clean stream task card patch for Hermes Agent
+
+## 快速导航
+
+- [功能特性](#功能特性)
+- [适用场景](#适用场景)
+- [仓库结构](#仓库结构)
+- [核心文件说明](#核心文件说明)
+- [`gateway/feishu_stream_card.py`](#gatewayfeishustreamcardpy)
+- [`gateway/progress_sanitizer.py`](#gatewayprogresssanitizerpy)
+- [`patches/feishu-card-integration.patch`](#patchesfeishu-card-integrationpatch)
+- [安装/集成方式](#安装集成方式)
+- [配置示例](#配置示例)
+
+---
+
 
 > 为 Hermes Agent 的飞书/Lark Gateway 增加“干净、可更新的长任务进度卡片”。
 
